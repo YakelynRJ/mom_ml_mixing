@@ -43,6 +43,7 @@
                                     cvmix_math_evaluate_cubic
   use cvmix_put_get,         only : cvmix_put
   use cvmix_utils,           only : cvmix_update_wrap
+  use iso_fortran_env,       only : error_unit
 
 !EOP
 
@@ -58,6 +59,7 @@
   integer, parameter :: CVMIX_KPP_MATCH_GRADIENT     = 2
   integer, parameter :: CVMIX_KPP_SIMPLE_SHAPES      = 3
   integer, parameter :: CVMIX_KPP_PARABOLIC_NONLOCAL = 4
+  integer, parameter :: CVMIX_KPP_ML_SHAPE           = 5
   integer, parameter :: NO_LANGMUIR_MIXING           = -1
   integer, parameter :: LANGMUIR_MIXING_LWF16        = 1
   integer, parameter :: LANGMUIR_MIXING_RWHGK16      = 2
@@ -89,6 +91,7 @@
   public :: cvmix_kpp_EFactor_model
   public :: cvmix_kpp_ustokes_SL_model
   public :: cvmix_kpp_compute_ER_depth
+  public :: cvmix_kpp_compute_sigma_max
 
   interface cvmix_coeffs_kpp
     module procedure cvmix_coeffs_kpp_low
@@ -213,7 +216,6 @@
       real(cvmix_r8) :: ER_Cb             ! Entrainment Rule TKE buoyancy production weight [nondim]
       real(cvmix_r8) :: ER_Cs             ! Entrainment Rule TKE Stokes production weight [nondim]
       real(cvmix_r8) :: ER_Cu             ! Entrainment Rule TKE shear production weight [nondim]
-
   end type cvmix_kpp_params_type
 
 !EOP
@@ -267,7 +269,6 @@ contains
                                               lenhanced_diff,                 &
                                               lnonzero_surf_nonlocal,         &
                                               l_LMD_ws
-
 ! !OUTPUT PARAMETERS:
     type(cvmix_kpp_params_type), intent(inout), target, optional ::           &
                                               CVmix_kpp_params_user
@@ -459,6 +460,8 @@ contains
         case ('ParabolicNonLocal')
           call cvmix_put_kpp('MatchTechnique', CVMIX_KPP_PARABOLIC_NONLOCAL,  &
                              CVmix_kpp_params_user)
+        case ('ML_Diffusivity_Shape') ! ML_Diffusivity shape function
+          call cvmix_put_kpp('MatchTechnique', CVMIX_KPP_ML_SHAPE, CVmix_kpp_params_user)
         case DEFAULT
           print*, "ERROR: ", trim(MatchTechnique), " is not a valid choice ", &
                   "for MatchTechnique!"
@@ -679,6 +682,7 @@ contains
                           nlev, max_nlev,                                     &
                           CVmix_vars%LangmuirEnhancementFactor,               &
                           CVmix_vars%StokesMostXi,                            &
+                          CVmix_vars%Coriolis,                                &
                           CVmix_kpp_params_user)
 
     call cvmix_update_wrap(CVmix_kpp_params_in%handle_old_vals, max_nlev,     &
@@ -702,7 +706,7 @@ contains
                                   old_Mdiff, old_Tdiff, old_Sdiff, OBL_depth, &
                                   kOBL_depth, Tnonlocal, Snonlocal, surf_fric,&
                                   surf_buoy, nlev, max_nlev, Langmuir_EFactor,&
-                                  StokesXI,CVmix_kpp_params_user)
+                                  StokesXI,Coriolis,CVmix_kpp_params_user)
 
 ! !DESCRIPTION:
 !  Computes vertical diffusion coefficients for the KPP boundary layer mixing
@@ -727,6 +731,7 @@ contains
     ! Langmuir enhancement factor
     real(cvmix_r8), intent(in), optional :: Langmuir_EFactor
     real(cvmix_r8), intent(in), optional :: StokesXI
+    real(cvmix_r8), intent(in), optional :: Coriolis ! required for ML_diffusivity
 ! !INPUT/OUTPUT PARAMETERS:
     real(cvmix_r8), dimension(max_nlev+1), intent(inout) :: Mdiff_out,        &
                                                             Tdiff_out,        &
@@ -794,6 +799,12 @@ contains
     ! Parameters for Stokes_MOST
     real(cvmix_r8) :: Gcomposite, Hsigma, sigh, T_NLenhance , S_NLenhance , XIone
 
+    ! Parameters for the machine learning part, ML_diffusivity
+    real(cvmix_r8), dimension(4) :: MLshape, MLshape2 ! Coefficients for shape function for ML diffusivity
+    real(cvmix_r8) :: sigma_max ! sigma coordinate of location of maximum diffusivity
+    real(cvmix_r8) :: L_h ! Non-dimensional L_h = B*OBL_depth/u_*^3
+    real(cvmix_r8) :: E_h ! Non-dimensional E_h = OBL_depth * Coriolis /u_*
+    real(cvmix_r8) :: F_inter_func ! Stands for F_intermediate_function,
     ! Constant from params
     integer :: interp_type2, MatchTechnique
 
@@ -809,12 +820,12 @@ contains
     end if
     interp_type2   = CVmix_kpp_params_in%interp_type2
     MatchTechnique = CVmix_kpp_params_in%MatchTechnique
-
+    
     ! Output values should be set to input values
     Mdiff_out = old_Mdiff
     Tdiff_out = old_Tdiff
     Sdiff_out = old_Sdiff
-
+  
     ! (1) Column-specific parameters
     !
     ! Stability => positive surface buoyancy flux
@@ -830,7 +841,6 @@ contains
     else
       delta = (OBL_depth+zt(ktup))/(zt(ktup)-zt(ktup+1))
     end if
-
   if ( CVmix_kpp_params_in%lStokesMOST ) then             ! Stokes_MOST
 
         ! (2a) Compute turbulent scales at OBL depth
@@ -1190,8 +1200,23 @@ contains
           Tshape2(3) = -real(2,cvmix_r8)
           Tshape2(4) =  cvmix_one
           Sshape2 = Tshape2
+
+        elseif (MatchTechnique.eq.CVMIX_KPP_ML_SHAPE) then
+          ! Match for gradient term, use parabolic shape for nonlocal
+          sigma_max = cvmix_kpp_compute_sigma_max(OBL_depth, Coriolis,  &
+                                                  surf_buoy, surf_fric)
+          !build ML coefficient arrays  
+          write(error_unit,*) 'sigma_max=', sigma_max                                
+          call build_MLshape_coeffs(sigma_max, MLshape,MLshape2)
+          ! simple shape of the form sigma*(1-sigma)^2 for nonlocal term
+          Mshape(1) =  cvmix_zero
+          Mshape(2) =  cvmix_one
+          Mshape(3) = -real(2,cvmix_r8)
+          Mshape(4) =  cvmix_one
+          Tshape2    = Mshape
+          Sshape2    = Mshape
         else
-          ! Shape function is the same for gradient and nonlocal
+          ! match both gradient and nonlocal, so use same shape function for both
           Tshape2 = Tshape
           Sshape2 = Sshape
         end if
@@ -1209,10 +1234,29 @@ contains
                                             surf_fric, XIone, w_m, w_s,    &
                                             CVmix_kpp_params_user)
     do kw=2,kwup
-      !   (3b) Evaluate G(sigma) at each cell interface
-      MshapeAtS = cvmix_math_evaluate_cubic(Mshape, sigma(kw))
-      TshapeAtS = cvmix_math_evaluate_cubic(Tshape, sigma(kw))
-      SshapeAtS = cvmix_math_evaluate_cubic(Sshape, sigma(kw))
+      ! (3b) Evaluate G(sigma) at each cell interface
+      if (MatchTechnique.eq.CVMIX_KPP_ML_SHAPE) then
+        if (sigma(kw) <= sigma_max) then
+          Mshape = MLshape
+          Tshape = MLshape
+          Sshape = MLshape
+          MshapeAtS = cvmix_math_evaluate_cubic(Mshape, sigma(kw))
+          TshapeAtS = cvmix_math_evaluate_cubic(Tshape, sigma(kw))
+          SshapeAtS = cvmix_math_evaluate_cubic(Sshape, sigma(kw)/sigma_max)
+        else
+          Mshape = MLshape2
+          Tshape = MLshape2
+          Sshape = MLshape2
+          MshapeAtS = cvmix_math_evaluate_cubic(Mshape, sigma(kw))
+          TshapeAtS = cvmix_math_evaluate_cubic(Tshape, sigma(kw))
+          SshapeAtS = cvmix_math_evaluate_cubic(Sshape, sigma(kw))
+        endif
+        write(error_unit,*) 'MshapeAtS=', MshapeAtS
+      else
+        MshapeAtS = cvmix_math_evaluate_cubic(Mshape, sigma(kw))
+        TshapeAtS = cvmix_math_evaluate_cubic(Tshape, sigma(kw))
+        SshapeAtS = cvmix_math_evaluate_cubic(Sshape, sigma(kw))
+      end if
       ! The RWHGK16 Langmuir uses the shape function to shape the
       !  enhancement to the mixing coefficient.
       ShapeNoMatchAtS = cvmix_math_evaluate_cubic(NMshape, sigma(kw))
@@ -2018,7 +2062,7 @@ contains
                                      lcl_Xi   ,                               &
                                      CVmix_vars%zBottomOceanNumerics,         &
                                      CVmix_kpp_params_user)
-
+    
 !EOC
 
   end subroutine cvmix_kpp_compute_OBL_depth_wrap
@@ -3682,5 +3726,87 @@ contains
 
   end subroutine cvmix_kpp_compute_ER_depth
 
+  function cvmix_kpp_compute_sigma_max(OBL_depth, Coriolis, bfsfc, ustar)
+
+    !-----------------------------------------------------------------------
+    ! Compute sigma_max for ML_diffusivity option.
+    ! Inputs:
+    !   OBL_depth  : boundary layer depth (m)
+    !   Coriolis   : Coriolis parameter (1/s)
+    !   bfsfc      : surface buoyancy forcing (m^2/s^3)  (sign matters)
+    !   ustar      : friction velocity (m/s)
+    ! Output:
+    !   sigma_max  : nondimensional, capped between [0.1, 0.7]
+    !-----------------------------------------------------------------------
+    real(cvmix_r8), intent(in) :: OBL_depth , Coriolis
+    !type(cvmix_data_type), intent(in) :: CVmix_vars
+    real(cvmix_r8), intent(in), optional :: bfsfc, ustar
+    real(cvmix_r8) :: cvmix_kpp_compute_sigma_max
+    !real(cvmix_r8) :: Coriolis
+    real(cvmix_r8) :: L_h, E_h, F_inter_func
+    real(cvmix_r8) :: surf_buoy, surf_fric
+    !-----------------------------------------------------------------------
+    ! Evaluate L_h and E_h
+    !-----------------------------------------------------------------------
+    !Coriolis = CVmix_vars%Coriolis
+    surf_buoy = bfsfc
+    surf_fric = max(ustar,1e-12_cvmix_r8)
+    L_h = -surf_buoy * OBL_depth / (surf_fric**3.0_cvmix_r8) ! OBL / Monin-Obukhov-Depth
+    E_h = OBL_depth * abs(Coriolis) / surf_fric ! OBL / Ekman Depth i.e. hf/u*
+    write(error_unit,*) 'L_h=', L_h
+    write(error_unit,*) 'E_h=', E_h
+    E_h = min(E_h,2.0_cvmix_r8) ! cap E_h to avoid overflow in the exponential function below
+    L_h = min(max(L_h, -8.0_cvmix_r8), 8.0_cvmix_r8) ! cap L_h to avoid overflow in the exponential function below
+    write(error_unit,*) 'L_h_2=', L_h
+    write(error_unit,*) 'E_h_2=', E_h
+    !-----------------------------------------------------------------------
+    ! Intermediate function
+    !-----------------------------------------------------------------------
+    F_inter_func = (cvmix_one / (0.0712_cvmix_r8 + 0.4380_cvmix_r8 * exp(-2.6821_cvmix_r8 * L_h))) +1.5845_cvmix_r8
+    !-----------------------------------------------------------------------
+    ! sigma_max
+    !-----------------------------------------------------------------------
+    cvmix_kpp_compute_sigma_max = (F_inter_func * E_h) / (1.7908_cvmix_r8 * (F_inter_func * E_h) + 0.6904_cvmix_r8)
+    !-----------------------------------------------------------------------
+    ! Cap sigma_max between 0.1 and 0.7
+    !-----------------------------------------------------------------------
+    cvmix_kpp_compute_sigma_max = MIN(MAX(cvmix_kpp_compute_sigma_max,         &
+                                        0.1_cvmix_r8), 0.7_cvmix_r8)
+
+  end function cvmix_kpp_compute_sigma_max
+
+  subroutine build_MLshape_coeffs(sigma_max, MLshape, MLshape2)
+    real(cvmix_r8), intent(in)  :: sigma_max
+    real(cvmix_r8), intent(out) :: MLshape(4)
+    real(cvmix_r8), intent(out) :: MLshape2(4)
+    real(cvmix_r8) :: scale, a , b
+    real(cvmix_r8), parameter :: eps = 1.0e-12_cvmix_r8
+    scale = 4.0_cvmix_r8 / 27.0_cvmix_r8
+
+    ! =====================================================
+    ! cuadratic profile encoded as cubic 
+    ! g = (2σ/σm) - (σ/σm)^2 
+    ! =====================================================
+    MLshape(1) = 0.0_cvmix_r8
+    MLshape(2) =  2.0_cvmix_r8 / sigma_max 
+    MLshape(3) = -1.0_cvmix_r8 / (sigma_max**2) 
+    MLshape(4) = 0.0_cvmix_r8
+    MLshape = MLshape * scale
+
+    ! =====================================================
+    ! cubic profile 
+    ! a = σm
+    ! b = 1-σm
+    ! g =  (-2a^3 - 3a^2b + b^3)/b^3 + (6a^2 + 6ab)/b^3 σ + (-6a - 3b)/b^3 σ^2 + 2/b^3 σ^3
+    ! =====================================================
+    a = sigma_max
+    b = 1.0_cvmix_r8 - sigma_max
+    MLshape2(1) = (-2.0_cvmix_r8*a**3 - 3.0_cvmix_r8*a*a*b + b**3) / (b**3)
+    MLshape2(2) = ( 6.0_cvmix_r8*a*a + 6.0_cvmix_r8*a*b) / (b**3)
+    MLshape2(3) = (-6.0_cvmix_r8*a - 3.0_cvmix_r8*b) / (b**3)
+    MLshape2(4) =  2.0_cvmix_r8 / (b**3)
+    MLshape2 = MLshape2 * scale
+
+  end subroutine build_MLshape_coeffs
 
 end module cvmix_kpp
